@@ -26,8 +26,6 @@ use asciiquarium::{entity, render, spawn};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -76,16 +74,20 @@ fn run(
     duration: Option<Duration>,
     exit_on_any_key: bool,
 ) -> io::Result<()> {
-    // A termination signal (SIGTERM/SIGHUP) or the console window closing sets
-    // this flag; the loop then returns normally so the TerminalGuard's Drop runs
-    // and restores the terminal. (Ctrl-C arrives as a key and is handled below.)
-    // ctrlc abstracts the per-platform signal vs console-handler details.
-    let terminate = Arc::new(AtomicBool::new(false));
-    {
-        let terminate = Arc::clone(&terminate);
-        ctrlc::set_handler(move || terminate.store(true, Ordering::Relaxed))
-            .map_err(io::Error::other)?;
-    }
+    // A termination signal (SIGTERM/SIGHUP, or the console window closing)
+    // restores the terminal and exits from the handler thread directly. It
+    // must not just set a flag for the main loop: when the terminal dies out
+    // from under us (pty master closed), crossterm's event poll spins on the
+    // EOF'd tty without returning, so the main loop never runs again and a
+    // flag would never be checked -- the process would survive SIGTERM/SIGHUP
+    // and busy-loop until SIGKILL. (Ctrl-C arrives as a key in raw mode and
+    // is handled in the loop below.) ctrlc abstracts the per-platform signal
+    // vs console-handler details.
+    ctrlc::set_handler(|| {
+        restore_terminal(&mut io::stdout());
+        std::process::exit(0);
+    })
+    .map_err(io::Error::other)?;
 
     let mut rng = rand::thread_rng();
     let (mut w, mut h) = terminal::size()?;
@@ -96,11 +98,7 @@ fn run(
     let started = Instant::now();
 
     loop {
-        // A caught signal (SIGTERM, SIGHUP, ...) exits via the guard. Only an
-        // uncatchable SIGKILL can skip cleanup.
-        if terminate.load(Ordering::Relaxed)
-            || duration.is_some_and(|duration| started.elapsed() >= duration)
-        {
+        if duration.is_some_and(|duration| started.elapsed() >= duration) {
             return Ok(());
         }
 
@@ -312,9 +310,16 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(self.out, cursor::Show, EnableLineWrap, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        restore_terminal(&mut self.out);
     }
+}
+
+/// Undo TerminalGuard::enter. Shared by the guard's Drop (normal exits and
+/// panics) and the termination-signal handler (which exits without unwinding).
+/// Every step tolerates a dead terminal.
+fn restore_terminal(out: &mut io::Stdout) {
+    let _ = execute!(out, cursor::Show, EnableLineWrap, LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
 }
 
 #[cfg(test)]
