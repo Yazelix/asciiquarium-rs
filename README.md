@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a>
+  <a href="#upstream-installation">Install</a>
   &middot;
   <a href="#credit-and-lineage">Credits</a>
   &middot;
@@ -59,7 +59,37 @@ The full cast: fish ([both art sets](#credit-and-lineage)) and their bubbles,
 seaweed, a castle, and a rotating headliner: shark, ship, whale with a spout,
 sea monster, or big fish. Pass `-c` for classic mode (the original art only).
 
-## Install
+## Yazelix fork
+
+This fork of [cablehead/asciiquarium-rs](https://github.com/cablehead/asciiquarium-rs)
+starts at `beef5b7dae179937c67f9e1557e02d64be55fa71`. The fork changes the
+CLI/input handoff for Anima; art, scene composition, and standalone controls
+remain upstream-owned. The GPL-2.0-or-later license and credits below apply.
+Anima packages this program as a separate executable, not a linked library.
+
+`--hosted` requires the caller to own raw mode, the alternate screen, cursor,
+and line-wrap state. Aquarium alone reads terminal input while running. It
+returns these exit statuses after stopping its event loop:
+
+- `10`: unmodified Left/h/p requests the previous animation.
+- `11`: unmodified Right/l/n requests the next animation.
+- `0`: another key, timer expiry, or a termination signal requests exit.
+
+Key-release events do nothing. Other nonzero statuses are failures, not
+navigation. The host must reap the child and restore terminal state, including
+on shutdown or forced termination; hosted mode does not change terminal modes.
+`--hosted` conflicts with `--exit-on-any-key`.
+
+`--duration-millis N` accepts sub-second budgets and treats zero as immediate
+exit. It conflicts with `--duration-seconds`. The host must enforce its own
+original deadline across process startup and handoffs; a child-relative timer
+alone cannot account for time before the child starts.
+
+Build this fork with `cargo build --release --locked`, or use Anima's pinned
+Nix package. The upstream installation commands below do not include this
+contract. Return to upstream when it offers an equivalent hosted contract.
+
+## Upstream installation
 
 Prebuilt binaries for Linux, macOS, and Windows are on the
 [releases page](https://github.com/cablehead/asciiquarium-rs/releases/latest).

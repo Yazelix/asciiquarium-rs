@@ -26,12 +26,13 @@ use asciiquarium::{entity, render, spawn};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::num::NonZeroU64;
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -51,29 +52,52 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     duration_seconds: Option<NonZeroU64>,
 
+    /// Exit after this many milliseconds; zero exits immediately.
+    #[arg(long, value_name = "MILLISECONDS", conflicts_with = "duration_seconds")]
+    duration_millis: Option<u64>,
+
     /// Exit on any key instead of reserving keys for controls.
     #[arg(long)]
     exit_on_any_key: bool,
+
+    /// Use host-owned terminal modes; exit 10 for previous, 11 for next, 0 to quit.
+    #[arg(long, conflicts_with = "exit_on_any_key")]
+    hosted: bool,
 }
 
-fn main() -> io::Result<()> {
+impl Cli {
+    fn duration(&self) -> Option<Duration> {
+        self.duration_millis.map(Duration::from_millis).or_else(|| {
+            self.duration_seconds
+                .map(|seconds| Duration::from_secs(seconds.get()))
+        })
+    }
+}
+
+fn main() -> io::Result<ExitCode> {
+    let started = Instant::now();
     let cli = Cli::parse();
-    let mut term = TerminalGuard::enter()?;
-    run(
-        &mut term.out,
-        cli.classic,
-        cli.duration_seconds
-            .map(|seconds| Duration::from_secs(seconds.get())),
-        cli.exit_on_any_key,
-    )
+    if cli.duration() == Some(Duration::ZERO) {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _term = if cli.hosted {
+        None
+    } else {
+        Some(TerminalGuard::enter()?)
+    };
+    run(&mut io::stdout(), &cli, started).map(ExitCode::from)
 }
 
-fn run(
-    out: &mut impl Write,
-    classic: bool,
-    duration: Option<Duration>,
-    exit_on_any_key: bool,
-) -> io::Result<()> {
+fn hosted_key(key: KeyEvent) -> Option<u8> {
+    match (key.kind, key.modifiers.is_empty(), key.code) {
+        (KeyEventKind::Release, _, _) => None,
+        (_, true, KeyCode::Left | KeyCode::Char('h' | 'p')) => Some(10),
+        (_, true, KeyCode::Right | KeyCode::Char('l' | 'n')) => Some(11),
+        _ => Some(0),
+    }
+}
+
+fn run(out: &mut impl Write, cli: &Cli, started: Instant) -> io::Result<u8> {
     // A termination signal (SIGTERM/SIGHUP, or the console window closing)
     // restores the terminal and exits from the handler thread directly. It
     // must not just set a flag for the main loop: when the terminal dies out
@@ -83,23 +107,27 @@ fn run(
     // and busy-loop until SIGKILL. (Ctrl-C arrives as a key in raw mode and
     // is handled in the loop below.) ctrlc abstracts the per-platform signal
     // vs console-handler details.
-    ctrlc::set_handler(|| {
-        restore_terminal(&mut io::stdout());
+    let hosted = cli.hosted;
+    ctrlc::set_handler(move || {
+        if !hosted {
+            restore_terminal(&mut io::stdout());
+        }
         std::process::exit(0);
     })
     .map_err(io::Error::other)?;
 
     let mut rng = rand::thread_rng();
+    let classic = cli.classic;
+    let duration = cli.duration();
     let (mut w, mut h) = terminal::size()?;
     let mut screen = render::Screen::new(w, h);
     let mut tick: u64 = 0;
     let mut entities = build_scene(w, h, classic, &mut rng);
     let mut paused = false;
-    let started = Instant::now();
 
     loop {
         if duration.is_some_and(|duration| started.elapsed() >= duration) {
-            return Ok(());
+            return Ok(0);
         }
 
         // poll() is both the input reader and the ~10fps frame clock: it blocks
@@ -111,15 +139,21 @@ fn run(
         if event::poll(poll_duration)? {
             match event::read()? {
                 Event::Key(k) => {
-                    if exit_on_any_key {
-                        return Ok(());
+                    if hosted {
+                        if let Some(code) = hosted_key(k) {
+                            return Ok(code);
+                        }
+                        continue;
+                    }
+                    if cli.exit_on_any_key {
+                        return Ok(0);
                     }
                     match k.code {
                         // Raw mode swallows SIGINT, so handle Ctrl-C / Ctrl-D here.
                         KeyCode::Char('c' | 'd') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
+                            return Ok(0);
                         }
-                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('q') => return Ok(0),
                         KeyCode::Char('p') => paused = !paused,
                         KeyCode::Char('r') => entities = build_scene(w, h, classic, &mut rng),
                         _ => {}
@@ -325,6 +359,60 @@ fn restore_terminal(out: &mut io::Stdout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_navigation_and_subsecond_deadlines() {
+        use crossterm::event::{KeyEvent, KeyEventKind};
+        for (code, expected) in [
+            (KeyCode::Left, 10),
+            (KeyCode::Char('h'), 10),
+            (KeyCode::Char('p'), 10),
+            (KeyCode::Right, 11),
+            (KeyCode::Char('l'), 11),
+            (KeyCode::Char('n'), 11),
+            (KeyCode::Char('q'), 0),
+        ] {
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                assert_eq!(
+                    hosted_key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)),
+                    Some(expected)
+                );
+            }
+            assert_eq!(
+                hosted_key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release
+                )),
+                None
+            );
+            assert_eq!(
+                hosted_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                Some(0)
+            );
+        }
+        for millis in [0, 1, 350] {
+            let cli = Cli::try_parse_from([
+                "asciiquarium-rs",
+                "--hosted",
+                "--duration-millis",
+                &millis.to_string(),
+            ])
+            .unwrap();
+            assert!(cli.hosted);
+            assert_eq!(cli.duration(), Some(Duration::from_millis(millis)));
+        }
+        assert!(Cli::try_parse_from([
+            "asciiquarium-rs",
+            "--duration-millis",
+            "10",
+            "--duration-seconds",
+            "1"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["asciiquarium-rs", "--hosted", "--exit-on-any-key"]).is_err());
+        assert!(!Cli::try_parse_from(["asciiquarium-rs"]).unwrap().hosted);
+    }
 
     #[test]
     fn parses_bounded_run_options() {
